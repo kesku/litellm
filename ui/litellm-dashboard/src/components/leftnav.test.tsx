@@ -2,6 +2,7 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { renderWithProviders } from "../../tests/test-utils";
 import Sidebar, { menuGroups, getBreadcrumb } from "./leftnav";
+import { all_admin_roles, internalUserRoles } from "../utils/roles";
 
 vi.mock("../utils/roles", () => {
   return {
@@ -10,9 +11,13 @@ vi.mock("../utils/roles", () => {
     rolesWithWriteAccess: ["admin", "internal"],
     rolesAllowedToViewWriteScopedPages: ["admin", "internal", "admin_viewer"],
     isAdminRole: (role: string) => role === "admin" || role === "admin_viewer",
-    isUserTeamAdminForAnyTeam: () => false,
+    isUserTeamAdminForAnyTeam: mockIsUserTeamAdminForAnyTeam,
   };
 });
+
+const { mockIsUserTeamAdminForAnyTeam } = vi.hoisted(() => ({
+  mockIsUserTeamAdminForAnyTeam: vi.fn(() => false),
+}));
 
 const { mockUseAuthorized, mockUseOrganizations } = vi.hoisted(() => {
   const mockUseAuthorized = vi.fn(() => ({
@@ -73,6 +78,18 @@ vi.mock("@/app/(dashboard)/hooks/useLogout", () => ({
 const collectNavKeys = (): string[] =>
   menuGroups.flatMap((group) => group.items.flatMap((item) => [item.key, ...(item.children ?? []).map((c) => c.key)]));
 
+// Every place a page id appears in the nav, as "GROUP" for a top-level item or
+// "GROUP > parentKey" for a child.
+const placementsOf = (page: string): string[] =>
+  menuGroups.flatMap((group) => [
+    ...group.items.filter((item) => item.page === page).map(() => group.groupLabel),
+    ...group.items.flatMap((item) =>
+      (item.children ?? []).filter((child) => child.page === page).map(() => `${group.groupLabel} > ${item.key}`),
+    ),
+  ]);
+
+const topLevelItem = (page: string) => menuGroups.flatMap((group) => group.items).find((item) => item.page === page);
+
 describe("Sidebar (leftnav)", () => {
   const defaultProps = {
     setPage: vi.fn(),
@@ -87,6 +104,7 @@ describe("Sidebar (leftnav)", () => {
       "Virtual Keys",
       "Playground",
       "Models + Endpoints",
+      "Router Settings",
       "Agentic",
       "MCP Servers",
       "Guardrails",
@@ -123,6 +141,57 @@ describe("Sidebar (leftnav)", () => {
       expect(screen.getByText("Search Tools")).toBeInTheDocument();
     });
   });
+  it("exposes Router Settings as a top-level AI Gateway item, not a Settings child", () => {
+    // Router Settings is admin-only, so getAvailablePages() filters it out entirely and the
+    // page_utils duplicate-key guard cannot see it. Walk menuGroups directly, otherwise a
+    // copy-instead-of-move (left under Settings AND added to AI Gateway) ships silently.
+    expect(placementsOf("router-settings")).toEqual(["AI GATEWAY"]);
+  });
+
+  it("shows Router Settings to a team admin, who may manage their team's auto routers", () => {
+    // Team admins are not in all_admin_roles, but the backend lets them create team-scoped
+    // models, and this page is now the only route to auto-router creation.
+    mockUseAuthorized.mockReturnValueOnce({
+      userId: "team-admin",
+      accessToken: "test-access-token",
+      userRole: "internal",
+      token: "test-token",
+      userEmail: "ta@example.com",
+      premiumUser: false,
+      disabledPersonalKeyCreation: false,
+      showSSOBanner: false,
+    });
+    mockIsUserTeamAdminForAnyTeam.mockReturnValueOnce(true);
+
+    renderWithProviders(<Sidebar {...defaultProps} />);
+    expect(screen.getByText("Router Settings")).toBeInTheDocument();
+  });
+
+  it("hides Router Settings from a non-admin who is not a team admin", () => {
+    mockUseAuthorized.mockReturnValueOnce({
+      userId: "plain",
+      accessToken: "test-access-token",
+      userRole: "internal",
+      token: "test-token",
+      userEmail: "plain@example.com",
+      premiumUser: false,
+      disabledPersonalKeyCreation: false,
+      showSSOBanner: false,
+    });
+
+    renderWithProviders(<Sidebar {...defaultProps} />);
+    expect(screen.queryByText("Router Settings")).not.toBeInTheDocument();
+  });
+
+  it("keeps Router Settings admin-only after the move out of the Settings group", () => {
+    // The SETTINGS group carried a group-level role gate; AI GATEWAY does not, so the item's
+    // own roles are now the only thing keeping it off an internal user's sidebar.
+    const routerSettings = topLevelItem("router-settings");
+
+    expect(routerSettings?.roles).toEqual(all_admin_roles);
+    expect(routerSettings?.roles?.filter((role) => internalUserRoles.includes(role))).toEqual([]);
+  });
+
   it("has no duplicate keys among all menu items and their children", () => {
     // React keys must be unique across the whole nav config, otherwise the
     // active-item highlight and group expansion collide.
@@ -265,6 +334,10 @@ describe("getBreadcrumb", () => {
 
   it("resolves a nested child page to its parent section", () => {
     expect(getBreadcrumb("search-tools")).toEqual({ section: "AI Gateway", title: "Search Tools" });
+  });
+
+  it("resolves router-settings under AI Gateway now that it is a top-level item", () => {
+    expect(getBreadcrumb("router-settings")).toEqual({ section: "AI Gateway", title: "Router Settings" });
   });
 
   it("falls back to a prettified title with no section for unknown pages", () => {

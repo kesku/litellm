@@ -13,6 +13,16 @@ vi.mock("@/components/networking", () => ({
 vi.mock("@/components/router_settings", () => ({ default: () => null }));
 vi.mock("@/components/Settings/RouterSettings/Fallbacks/Fallbacks", () => ({ default: () => null }));
 vi.mock("@/components/routing_groups", () => ({ default: () => null }));
+vi.mock("./AutoRouters/AutoRoutersPanel", () => ({
+  AutoRoutersPanel: ({ canModify }: { canModify: boolean }) => (
+    <div data-testid="auto-routers-panel">canModify:{String(canModify)}</div>
+  ),
+}));
+
+const { useTeams } = vi.hoisted(() => ({ useTeams: vi.fn(() => ({ data: [] })) }));
+vi.mock("@/app/(dashboard)/hooks/teams/useTeams", () => ({ useTeams }));
+
+const TEAM_ADMIN_TEAMS = [{ team_id: "t1", members_with_roles: [{ user_id: "team-admin", role: "admin" }] }];
 
 // Mirrors the /config/list ordering: the two prompt-caching rows sit between the
 // General-tab rows in the unfiltered response but are filtered out of the General
@@ -97,5 +107,49 @@ describe("GeneralSettings General tab", () => {
 
     expect(deleteConfigFieldSetting).toHaveBeenCalledWith("token", "max_ui_session_budget");
     expect(within(row).getByRole("spinbutton")).toHaveValue("1.00");
+  });
+});
+
+// A team admin is not in all_admin_roles, so before this gating they lost the only supported UI
+// path for creating a team-scoped auto router when the Add Model entry point was removed.
+describe("GeneralSettings role gating", () => {
+  beforeEach(() => {
+    vi.mocked(getGeneralSettingsCall).mockResolvedValue([]);
+    useTeams.mockReturnValue({ data: [] });
+  });
+
+  it("shows every tab to a proxy admin", async () => {
+    renderWithProviders(<GeneralSettings accessToken="token" userRole="proxy_admin" userID="u" />);
+
+    expect(await screen.findByRole("tab", { name: "Auto Router" })).toBeInTheDocument();
+    ["Loadbalancing", "Routing Groups", "Fallbacks", "Prompt Caching", "General"].forEach((name) => {
+      expect(screen.getByRole("tab", { name })).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("auto-routers-panel")).toHaveTextContent("canModify:true");
+  });
+
+  it("shows a team admin only the Auto Router tab, and lets them write", async () => {
+    useTeams.mockReturnValue({ data: TEAM_ADMIN_TEAMS });
+
+    renderWithProviders(<GeneralSettings accessToken="token" userRole="Internal User" userID="team-admin" />);
+
+    expect(await screen.findByRole("tab", { name: "Auto Router" })).toBeInTheDocument();
+    ["Loadbalancing", "Routing Groups", "Fallbacks", "Prompt Caching", "General"].forEach((name) => {
+      expect(screen.queryByRole("tab", { name })).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId("auto-routers-panel")).toHaveTextContent("canModify:true");
+  });
+
+  it("gives an admin viewer the tabs but no auto-router writes", async () => {
+    renderWithProviders(<GeneralSettings accessToken="token" userRole="Admin Viewer" userID="u" />);
+
+    expect(await screen.findByRole("tab", { name: "Loadbalancing" })).toBeInTheDocument();
+    expect(screen.getByTestId("auto-routers-panel")).toHaveTextContent("canModify:false");
+  });
+
+  it("gives a plain internal user no write access", async () => {
+    renderWithProviders(<GeneralSettings accessToken="token" userRole="Internal User" userID="nobody" />);
+
+    expect(await screen.findByTestId("auto-routers-panel")).toHaveTextContent("canModify:false");
   });
 });

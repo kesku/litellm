@@ -133,6 +133,13 @@ const menuGroups: MenuGroup[] = [
         roles: rolesAllowedToViewWriteScopedPages,
       },
       {
+        key: "router-settings",
+        page: "router-settings",
+        label: "Router Settings",
+        icon: <Route {...ICON} />,
+        roles: all_admin_roles,
+      },
+      {
         key: "agentic",
         page: "agentic",
         label: "Agentic",
@@ -297,13 +304,6 @@ const menuGroups: MenuGroup[] = [
         roles: all_admin_roles,
         children: [
           {
-            key: "router-settings",
-            page: "router-settings",
-            label: "Router Settings",
-            icon: <Route {...ICON} />,
-            roles: all_admin_roles,
-          },
-          {
             key: "logging-and-alerts",
             page: "logging-and-alerts",
             label: "Logging & Alerts",
@@ -463,6 +463,12 @@ const Sidebar_: React.FC<SidebarProps> = ({
           !(allowVectorStoresForTeamAdmins && isTeamAdmin)
         )
           return false;
+        // Router Settings is proxy-admin territory except for its Auto Router tab, which a team
+        // admin may use to manage their own team's auto routers (the backend allows a team admin
+        // to create team-scoped models). The page gates its proxy-wide tabs itself. Returns
+        // early so the internal-user visibility list below cannot hide it: getAvailablePages()
+        // never offers an admin-only page as a checkbox, so it could never be enabled there.
+        if (item.key === "router-settings" && !isAdmin) return isTeamAdmin;
         if (item.roles && !item.roles.includes(userRole)) return false;
         if (!isAdmin && enabledPagesInternalUsers != null) {
           if (item.children && item.children.length > 0) {

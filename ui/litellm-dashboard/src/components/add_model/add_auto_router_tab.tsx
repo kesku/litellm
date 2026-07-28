@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from "react";
 import { Card, Form, Button, Tooltip, Typography, Select as AntdSelect, Radio, Badge, Space, Modal } from "antd";
-import type { FormInstance } from "antd";
 import { ThunderboltOutlined, BranchesOutlined } from "@ant-design/icons";
 import { Text, TextInput } from "@tremor/react";
 import { modelAvailableCall } from "../networking";
@@ -27,7 +26,6 @@ import AutoRouterConnectionTest from "./auto_router_connection_test";
 import NotificationManager from "../molecules/notifications_manager";
 
 interface AddAutoRouterTabProps {
-  form: FormInstance;
   handleOk: () => void;
   accessToken: string;
   userRole: string;
@@ -37,7 +35,8 @@ type RouterType = "recommended" | "semantic";
 
 const { Title } = Typography;
 
-const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({ form, handleOk, accessToken, userRole }) => {
+const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({ handleOk, accessToken, userRole }) => {
+  const [form] = Form.useForm();
   const [modelAccessGroups, setModelAccessGroups] = useState<string[]>([]);
   const [modelInfo, setModelInfo] = useState<ModelGroup[]>([]);
 
