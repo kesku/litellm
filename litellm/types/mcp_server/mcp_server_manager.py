@@ -27,10 +27,9 @@ class MCPOAuthMetadata(BaseModel):
     token_url: Optional[str] = None
     registration_url: Optional[str] = None
     discovered_issuer: Optional[str] = None
-    """The ``issuer`` the authorization-server metadata document self-attests (RFC 8414). Persisted
-    trust-on-first-use as the server's ``issuer`` when none is configured, so that later rebuilds
-    anchor discovery on it (RFC 8414 §3.3) and a subsequently compromised resource cannot re-point
-    it. Never overwrites an admin-configured issuer."""
+    """The ``issuer`` the authorization-server metadata document self-attests (RFC 8414). Recorded
+    as an observation (``credentials.discovered_issuer``) for token identity and display; never
+    written to the declared ``issuer`` column, which only an admin writes."""
     from_origin_fallback: bool = False
     """True when the metadata came from guessing the resource origin as its authorization
     server rather than from an RFC 9728/8414-advertised document. Guessed endpoints are

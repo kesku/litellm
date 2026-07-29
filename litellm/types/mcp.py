@@ -1,4 +1,5 @@
 import enum
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel
@@ -88,6 +89,29 @@ class MCPPublicServer(BaseModel):
 # OAuth 2.0 token-endpoint client authentication method (RFC 6749 section 2.3.1).
 MCPTokenEndpointAuthMethod = Literal["client_secret_basic", "client_secret_post"]
 
+# The one credentials key holding the gateway's durable OAuth status: the output of the last fully
+# successful, fully gated resolution, together with the declared inputs it was resolved under and a
+# semantics version. Written atomically by exactly one writer and reusable only under input equality,
+# so it is never merged, re-validated field by field, or partially updated
+MCP_LAST_GOOD_RESOLUTION_CREDENTIAL_KEY = "last_good_resolution"
+
+
+class MCPLastGoodResolution(TypedDict):
+    version: int
+    """Resolution-semantics version this snapshot was produced under; mismatches are ignored."""
+
+    inputs: Mapping[str, object]
+    """The declared inputs (url, auth_type, oauth2_flow, issuer, endpoint URLs, scopes,
+    token_exchange_endpoint, dcr_bridge) the resolution ran under, stored verbatim so an operator can
+    see exactly why a snapshot stopped applying. Equality with the current declared inputs is the
+    entire validity check."""
+
+    issuer: Optional[str]
+    authorization_url: Optional[str]
+    token_url: Optional[str]
+    registration_url: Optional[str]
+    scopes: Optional[Sequence[str]]
+
 
 class MCPCredentials(TypedDict, total=False):
     auth_value: Optional[str]
@@ -108,6 +132,13 @@ class MCPCredentials(TypedDict, total=False):
     scopes: Optional[List[str]]
     """
     OAuth 2.0 scopes to request when exchanging the client credentials
+    """
+
+    last_good_resolution: Optional[MCPLastGoodResolution]
+    """
+    Durable OAuth status: see ``MCPLastGoodResolution``. Written only by the discovery build path,
+    only from a complete fresh resolution, never from fallback output. Not a secret, stored
+    unencrypted.
     """
 
     # AWS SigV4 fields

@@ -18,6 +18,7 @@ from litellm.proxy._experimental.mcp_server.db import (
     update_mcp_server,
 )
 from litellm.proxy._types import NewMCPServerRequest, UpdateMCPServerRequest
+from litellm.types.mcp import MCP_LAST_GOOD_RESOLUTION_CREDENTIAL_KEY
 
 
 def _credentials_cleared(value) -> bool:
@@ -258,6 +259,40 @@ async def test_url_change_clears_stale_discovered_oauth_fields():
     assert data_dict["url"] == "https://new.example.com/mcp"
     for stale_field in ("issuer", "authorization_url", "token_url", "registration_url"):
         assert data_dict[stale_field] is None, f"{stale_field} must be cleared on url change"
+
+
+@pytest.mark.asyncio
+async def test_url_change_clears_stale_oauth_observations():
+    """The last-good resolution describes the upstream the server used to point at. It
+    self-invalidates on any declared-input change, so this clear is hygiene: it keeps a re-pointed
+    server's row from carrying a dead snapshot of the previous upstream indefinitely."""
+    mock_prisma = _mock_prisma()
+    existing = MagicMock()
+    existing.auth_type = "oauth2"
+    existing.url = "https://old.example.com/mcp"
+    existing.credentials = json.dumps(
+        {
+            "client_id": "cid",
+            MCP_LAST_GOOD_RESOLUTION_CREDENTIAL_KEY: {
+                "version": 1,
+                "inputs": {"url": "https://old.example.com/mcp"},
+                "issuer": "https://old-idp.example.com",
+                "authorization_url": "https://old-idp.example.com/authorize",
+                "token_url": "https://old-idp.example.com/token",
+                "registration_url": None,
+                "scopes": ["old.read"],
+            },
+        }
+    )
+    mock_prisma.db.litellm_mcpservertable.find_unique = AsyncMock(return_value=existing)
+
+    data = UpdateMCPServerRequest(server_id="my-test-server", url="https://new.example.com/mcp")
+    await update_mcp_server(mock_prisma, data, "test-user")
+    data_dict = mock_prisma.db.litellm_mcpservertable.update.call_args[1]["data"]
+
+    surviving = json.loads(data_dict["credentials"])
+    assert MCP_LAST_GOOD_RESOLUTION_CREDENTIAL_KEY not in surviving
+    assert surviving["client_id"] == "cid", "clearing observations must not touch the stored client"
 
 
 @pytest.mark.asyncio

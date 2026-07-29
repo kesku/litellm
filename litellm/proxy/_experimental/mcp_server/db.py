@@ -45,7 +45,7 @@ from litellm.repositories.verification_token_repository import (
     VerificationTokenRepository,
 )
 from litellm.types.llms.custom_http import httpxSpecialProvider
-from litellm.types.mcp import MCPCredentials
+from litellm.types.mcp import MCP_LAST_GOOD_RESOLUTION_CREDENTIAL_KEY, MCPCredentials
 
 if TYPE_CHECKING:
     from prisma import models as prisma_db_models
@@ -927,6 +927,21 @@ async def update_mcp_server(
                     ):
                         data_dict[te_field] = legacy_value
                 data_dict["credentials"] = safe_dumps(merged)
+
+    # The last-good resolution self-invalidates on any declared-input change (its stored inputs no
+    # longer match the row), so dropping it here is hygiene rather than a correctness requirement: it
+    # keeps a re-pointed server's row from carrying a dead snapshot of the previous upstream forever.
+    credentials_explicitly_cleared = "credentials" in data_dict and data_dict["credentials"] is None
+    if (auth_type_changed or url_changed or issuer_changed) and not credentials_explicitly_cleared:
+        stale_source = (
+            data_dict["credentials"] if "credentials" in data_dict else getattr(existing, "credentials", None)
+        )
+        if isinstance(stale_source, (str, dict)):
+            stale_blob = _credentials_blob_to_mutable_dict(stale_source)
+            if MCP_LAST_GOOD_RESOLUTION_CREDENTIAL_KEY in stale_blob:
+                data_dict["credentials"] = safe_dumps(
+                    {key: value for key, value in stale_blob.items() if key != MCP_LAST_GOOD_RESOLUTION_CREDENTIAL_KEY}
+                )
 
     # Add audit fields
     data_dict["updated_by"] = touched_by

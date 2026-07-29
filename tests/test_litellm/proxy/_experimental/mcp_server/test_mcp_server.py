@@ -4124,6 +4124,76 @@ class TestMCPServerManagerReload:
         assert manager.registry["server-1"] is rebuilt_server
 
     @pytest.mark.asyncio
+    async def test_rebuilds_oauth_server_whose_endpoints_are_unresolved(self):
+        """Discovery only runs at build time, so an interactive oauth2 server whose discovery came back
+        empty (transient upstream failure) stays broken while the updated_at fast path keeps reusing the
+        entry: /authorize serves "authorization url is not configured" until some unrelated config write
+        bumps the row. Such an entry is rebuilt on the normal reload cadence so discovery is retried."""
+        try:
+            from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+                MCPServerManager,
+            )
+        except ImportError:
+            pytest.skip("MCP server not available")
+
+        from litellm.types.mcp import MCPAuth
+
+        manager = MCPServerManager()
+        timestamp = datetime.utcnow()
+        unresolved = MCPServer(
+            server_id="server-1",
+            name="server",
+            transport=MCPTransport.http,
+            auth_type=MCPAuth.oauth2,
+            oauth2_flow="authorization_code",
+            updated_at=timestamp,
+        )
+        manager.registry = {unresolved.server_id: unresolved}
+
+        db_row = _make_db_mcp_server("server-1", timestamp)
+        rebuilt_server = MCPServer(
+            server_id="server-1",
+            name="server",
+            transport=MCPTransport.http,
+            auth_type=MCPAuth.oauth2,
+            oauth2_flow="authorization_code",
+            authorization_url="https://idp.example.com/authorize",
+            token_url="https://idp.example.com/token",
+            updated_at=timestamp,
+        )
+
+        mock_prisma = MagicMock()
+        mock_prisma.db.litellm_mcpservertable.find_many = AsyncMock(return_value=[db_row])
+        with (
+            patch(
+                "litellm.proxy.management_endpoints.mcp_management_endpoints.get_prisma_client_or_throw",
+                return_value=mock_prisma,
+            ),
+            patch.object(
+                manager,
+                "build_mcp_server_from_table",
+                AsyncMock(return_value=rebuilt_server),
+            ) as mock_build,
+        ):
+            await manager.reload_servers_from_database()
+
+        mock_build.assert_awaited_once_with(db_row, env_vars_are_encrypted=True)
+        assert manager.registry["server-1"] is rebuilt_server
+
+        manager.registry = {rebuilt_server.server_id: rebuilt_server}
+        with (
+            patch(
+                "litellm.proxy.management_endpoints.mcp_management_endpoints.get_prisma_client_or_throw",
+                return_value=mock_prisma,
+            ),
+            patch.object(manager, "build_mcp_server_from_table", AsyncMock()) as mock_build_again,
+        ):
+            await manager.reload_servers_from_database()
+
+        mock_build_again.assert_not_awaited()
+        assert manager.registry["server-1"] is rebuilt_server
+
+    @pytest.mark.asyncio
     async def test_skips_server_when_build_from_database_fails(self, caplog):
         try:
             from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
