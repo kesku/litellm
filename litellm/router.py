@@ -11137,6 +11137,17 @@ class Router:
                     if key != "model" and value is not None:
                         request_kwargs.setdefault(key, value)
 
+            # Stash the decision in the proxy-internal metadata bucket, resolved the
+            # same way spend logging reads it (`litellm_metadata` when present, else
+            # `metadata`). On routes where the caller's own `metadata` is a provider
+            # body field (e.g. /v1/messages), `litellm_metadata` already exists here,
+            # so the decision never lands in a dict that is forwarded upstream.
+            if pre_routing_hook_response.routing_decision is not None:
+                metadata_key = get_metadata_variable_name_from_kwargs(request_kwargs)
+                metadata_bucket = request_kwargs.setdefault(metadata_key, {})
+                if isinstance(metadata_bucket, dict):
+                    metadata_bucket["routing_decision"] = pre_routing_hook_response.routing_decision
+
         return pre_routing_hook_response
 
     def get_available_deployment(

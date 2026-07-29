@@ -24,6 +24,7 @@ from litellm.constants import RETURN_RAW_MODEL_NAME_METADATA_KEY
 from litellm.router_strategy.complexity_router.complexity_router import (
     ComplexityRouter,
     DimensionScore,
+    KeywordOverride,
 )
 from litellm.router_strategy.complexity_router.config import (
     DEFAULT_COMPLEXITY_CONFIG,
@@ -1381,21 +1382,27 @@ class TestLLMClassifier:
     async def test_aclassify_heuristic_skips_llm_call(self, complexity_router, mock_router_instance):
         """When classifier_type is 'heuristic' (default), aclassify must not call the LLM."""
         mock_router_instance.acompletion = AsyncMock()
-        tier, score, signals = await complexity_router.aclassify("Hello!")
+        outcome = await complexity_router.aclassify("Hello!")
         mock_router_instance.acompletion.assert_not_called()
-        assert tier == ComplexityTier.SIMPLE
+        assert outcome.tier == ComplexityTier.SIMPLE
+        assert outcome.cause == "heuristic_scorer"
+        assert outcome.score is not None
 
     @pytest.mark.asyncio
     async def test_aclassify_llm_success_routes_by_llm_verdict(self, llm_complexity_router, mock_router_instance):
         """A well-formed structured LLM response should decide the tier directly.
 
         Uses a prompt that heuristic scoring alone would classify as SIMPLE, to prove
-        the LLM verdict -- not the heuristic scorer -- is what decided the tier.
+        the LLM verdict -- not the heuristic scorer -- is what decided the tier. The
+        outcome must say so (cause) and must not fabricate a score: the LLM path
+        produces a tier label only.
         """
         mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "COMPLEX"}'))
-        tier, score, signals = await llm_complexity_router.aclassify("hi")
-        assert tier == ComplexityTier.COMPLEX
-        assert "llm-classifier:COMPLEX" in signals
+        outcome = await llm_complexity_router.aclassify("hi")
+        assert outcome.tier == ComplexityTier.COMPLEX
+        assert outcome.cause == "llm_classifier"
+        assert outcome.score is None
+        assert "llm-classifier:COMPLEX" in outcome.signals
         mock_router_instance.acompletion.assert_awaited_once()
         call_kwargs = mock_router_instance.acompletion.call_args.kwargs
         assert call_kwargs["model"] == "haiku-classifier"
@@ -1460,9 +1467,13 @@ class TestLLMClassifier:
     ):
         """A timeout/error from the classifier model must fall back to heuristic scoring."""
         mock_router_instance.acompletion = AsyncMock(side_effect=TimeoutError("classifier timed out"))
-        tier, score, signals = await llm_complexity_router.aclassify("Hello!")
-        assert tier == llm_complexity_router.classify("Hello!")[0]
-        assert tier == ComplexityTier.SIMPLE
+        outcome = await llm_complexity_router.aclassify("Hello!")
+        assert outcome.tier == llm_complexity_router.classify("Hello!")[0]
+        assert outcome.tier == ComplexityTier.SIMPLE
+        # The fallback ran the heuristic, and the outcome must say so even though
+        # the configured classifier_type is "llm".
+        assert outcome.cause == "heuristic_scorer"
+        assert outcome.score is not None
 
     @pytest.mark.asyncio
     async def test_aclassify_falls_back_to_heuristic_on_unparseable_response(
@@ -1470,8 +1481,9 @@ class TestLLMClassifier:
     ):
         """Non-JSON or schema-violating output must fall back to heuristic scoring, not raise."""
         mock_router_instance.acompletion = AsyncMock(return_value=_llm_response("not json"))
-        tier, score, signals = await llm_complexity_router.aclassify("Hello!")
-        assert tier == ComplexityTier.SIMPLE
+        outcome = await llm_complexity_router.aclassify("Hello!")
+        assert outcome.tier == ComplexityTier.SIMPLE
+        assert outcome.cause == "heuristic_scorer"
 
     @pytest.mark.asyncio
     async def test_aclassify_falls_back_to_heuristic_on_empty_content(
@@ -1479,8 +1491,9 @@ class TestLLMClassifier:
     ):
         """Empty/None message content (e.g. provider quirk) must fall back, not raise."""
         mock_router_instance.acompletion = AsyncMock(return_value=_llm_response(None))
-        tier, score, signals = await llm_complexity_router.aclassify("Hello!")
-        assert tier == ComplexityTier.SIMPLE
+        outcome = await llm_complexity_router.aclassify("Hello!")
+        assert outcome.tier == ComplexityTier.SIMPLE
+        assert outcome.cause == "heuristic_scorer"
 
     @pytest.mark.asyncio
     async def test_pre_routing_hook_uses_llm_classifier_end_to_end(self, llm_complexity_router, mock_router_instance):
@@ -1975,8 +1988,12 @@ class TestLexicalKeywordTierRules:
             litellm_router_instance=mock_router_instance,
             complexity_router_config=config,
         )
-        assert router._lexical_tier_override("hi there, please advise") == ComplexityTier.COMPLEX
-        assert router._lexical_tier_override("just saying hi") == ComplexityTier.SIMPLE
+        assert router._lexical_tier_override("hi there, please advise") == KeywordOverride(
+            tier=ComplexityTier.COMPLEX, matched_keyword="advise"
+        )
+        assert router._lexical_tier_override("just saying hi") == KeywordOverride(
+            tier=ComplexityTier.SIMPLE, matched_keyword="hi"
+        )
         assert router._lexical_tier_override("nothing relevant here") is None
 
     @pytest.mark.asyncio
@@ -2012,7 +2029,9 @@ class TestLexicalKeywordTierRules:
             litellm_router_instance=mock_router_instance,
             complexity_router_config=config,
         )
-        assert router._lexical_tier_override("running my k8s cluster") == ComplexityTier.REASONING
+        assert router._lexical_tier_override("running my k8s cluster") == KeywordOverride(
+            tier=ComplexityTier.REASONING, matched_keyword="k8s"
+        )
         assert router._lexical_tier_override("what is a k8scluster thing") is None
 
 
@@ -2653,7 +2672,7 @@ class TestRoutingDecisionCauseLogging:
             request_kwargs={},
             messages=[{"role": "user", "content": "What is the boiling point of water at sea level?"}],
         )
-        assert "routing decision cause=complexity_scorer" in router_log_capture.text
+        assert "routing decision cause=heuristic_scorer" in router_log_capture.text
         assert "score=" in router_log_capture.text
         assert "cause=literal_keyword_match" not in router_log_capture.text
         assert "cause=semantic_keyword_match" not in router_log_capture.text
@@ -3157,9 +3176,9 @@ class TestEscalationKeywords:
         assert complexity_router.escalation_keywords == ["LITELLM ESCALATE"]
 
     def test_escalation_triggered_is_case_sensitive(self, complexity_router):
-        assert complexity_router._escalation_triggered("please LITELLM ESCALATE now") is True
-        assert complexity_router._escalation_triggered("please litellm escalate now") is False
-        assert complexity_router._escalation_triggered("how do I escalate this ticket") is False
+        assert complexity_router._matched_escalation_keyword("please LITELLM ESCALATE now") == "LITELLM ESCALATE"
+        assert complexity_router._matched_escalation_keyword("please litellm escalate now") is None
+        assert complexity_router._matched_escalation_keyword("how do I escalate this ticket") is None
 
     def test_escalate_tier_bumps_one_step(self, complexity_router):
         assert complexity_router._escalate_tier(ComplexityTier.SIMPLE) == ComplexityTier.MEDIUM
@@ -3400,3 +3419,269 @@ class TestEscalationKeywords:
             messages=[{"role": "user", "content": "LITELLM ESCALATE do better"}],
         )
         assert result.model == "o1-b"  # unchanged: no random hop to o1-a / o1-c
+
+
+class TestRoutingDecisionContents:
+    """Every routing path must return a PreRoutingHookResponse carrying a routing_decision
+    that names the mechanism that actually decided, with the facts of that path only."""
+
+    @pytest.mark.asyncio
+    async def test_heuristic_decision_carries_score_signals_and_boundary_snapshot(self, complexity_router):
+        response = await complexity_router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={},
+            messages=[{"role": "user", "content": "Hello!"}],
+        )
+        assert response is not None
+        decision = response.routing_decision
+        assert decision is not None
+        assert decision["router_model_name"] == "test-complexity-router"
+        assert decision["router_type"] == "complexity"
+        assert decision["cause"] == "heuristic_scorer"
+        assert decision["tier"] == "SIMPLE"
+        assert decision["routed_model"] == response.model == "gpt-4o-mini"
+        assert isinstance(decision["score"], float)
+        assert any("short" in signal for signal in decision["signals"])
+        # The snapshot must reflect the CONFIGURED boundaries (the fixture overrides the
+        # 0.15/0.35/0.60 defaults), so a logged row stays truthful after config edits.
+        assert decision["tier_boundaries"] == {
+            "simple_medium": 0.25,
+            "medium_complex": 0.50,
+            "complex_reasoning": 0.75,
+        }
+        assert "escalated" not in decision
+        assert "classifier_model" not in decision
+
+    @pytest.mark.asyncio
+    async def test_llm_classifier_decision_names_judge_and_omits_score(
+        self, llm_complexity_router, mock_router_instance
+    ):
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "REASONING"}'))
+        response = await llm_complexity_router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={},
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert response is not None
+        decision = response.routing_decision
+        assert decision is not None
+        assert decision["cause"] == "llm_classifier"
+        assert decision["classifier_model"] == "haiku-classifier"
+        assert decision["tier"] == "REASONING"
+        # The LLM path produces a tier label, not a score: no synthetic score and no
+        # boundary snapshot may appear on these rows.
+        assert "score" not in decision
+        assert "tier_boundaries" not in decision
+
+    @pytest.mark.asyncio
+    async def test_llm_classifier_fallback_decision_reports_heuristic(
+        self, llm_complexity_router, mock_router_instance
+    ):
+        """A failed LLM classifier falls back to the heuristic, and the persisted cause
+        must say heuristic_scorer even though classifier_type is 'llm'."""
+        mock_router_instance.acompletion = AsyncMock(side_effect=TimeoutError("classifier timed out"))
+        response = await llm_complexity_router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={},
+            messages=[{"role": "user", "content": "Hello!"}],
+        )
+        assert response is not None
+        decision = response.routing_decision
+        assert decision is not None
+        assert decision["cause"] == "heuristic_scorer"
+        assert "classifier_model" not in decision
+        assert isinstance(decision["score"], float)
+
+    @pytest.mark.asyncio
+    async def test_keyword_override_decision_carries_matched_keyword(self, mock_router_instance, basic_config):
+        config = {
+            **basic_config,
+            "keyword_tier_rules": [{"keywords": ["deploy to k8s"], "tier": "REASONING"}],
+        }
+        router = ComplexityRouter(
+            model_name="test-complexity-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config=config,
+        )
+        response = await router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={},
+            messages=[{"role": "user", "content": "please deploy to k8s now"}],
+        )
+        assert response is not None
+        decision = response.routing_decision
+        assert decision is not None
+        assert decision["cause"] == "literal_keyword_match"
+        assert decision["matched_keyword"] == "deploy to k8s"
+        assert decision["tier"] == "REASONING"
+        assert "score" not in decision
+
+    @pytest.mark.asyncio
+    async def test_escalation_decision_carries_escalation_keyword(self, complexity_router):
+        response = await complexity_router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={},
+            messages=[{"role": "user", "content": "LITELLM ESCALATE what is 2+2"}],
+        )
+        assert response is not None
+        decision = response.routing_decision
+        assert decision is not None
+        assert decision["escalated"] is True
+        assert decision["escalation_keyword"] == "LITELLM ESCALATE"
+        assert "escalation" in decision["signals"]
+
+    @pytest.mark.asyncio
+    async def test_no_user_message_decision_is_default_fallback(self, complexity_router):
+        response = await complexity_router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={},
+            messages=[{"role": "system", "content": "be nice"}],
+        )
+        assert response is not None
+        decision = response.routing_decision
+        assert decision is not None
+        assert decision["cause"] == "default_fallback"
+        assert decision["routed_model"] == response.model
+        assert "tier" not in decision
+
+    @pytest.mark.asyncio
+    async def test_session_pin_decision(self, mock_router_instance, basic_config):
+        mock_router_instance.cache = DualCache()
+        router = ComplexityRouter(
+            model_name="test-complexity-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config={**basic_config, "session_affinity": True},
+        )
+        request_kwargs = {"metadata": {"session_id": "session-decision"}}
+        cache_key = router._get_session_affinity_cache_key("session-decision", request_kwargs)
+        await mock_router_instance.cache.async_set_cache(key=cache_key, value="gpt-4o")
+        response = await router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs=request_kwargs,
+            messages=[{"role": "user", "content": "hi again"}],
+        )
+        assert response is not None
+        decision = response.routing_decision
+        assert decision is not None
+        assert decision["cause"] == "session_affinity_pin"
+        assert decision["routed_model"] == "gpt-4o"
+        assert "escalated" not in decision
+
+    def test_reasoning_override_appends_signal(self, complexity_router):
+        tier, _score, signals = complexity_router.classify("Let's think step by step and prove the theorem.")
+        assert tier == ComplexityTier.REASONING
+        assert "reasoning-override" in signals
+
+
+class TestRoutingDecisionStash:
+    """Router.async_pre_routing_hook must persist the strategy's routing decision in the
+    proxy-internal metadata bucket that spend logging reads, for both bucket spellings."""
+
+    MODEL_LIST = [
+        {
+            "model_name": "smart-router",
+            "litellm_params": {
+                "model": "auto_router/complexity_router",
+                "complexity_router_config": {
+                    "tiers": {"SIMPLE": ["gpt-4o-mini"], "MEDIUM": ["gpt-4o"]},
+                    "session_affinity": False,
+                },
+            },
+        },
+        {"model_name": "gpt-4o-mini", "litellm_params": {"model": "openai/gpt-4o-mini"}},
+        {"model_name": "gpt-4o", "litellm_params": {"model": "openai/gpt-4o"}},
+    ]
+
+    @pytest.mark.asyncio
+    async def test_decision_lands_in_metadata_bucket(self):
+        router = Router(model_list=self.MODEL_LIST)
+        request_kwargs: Dict = {}
+        response = await router.async_pre_routing_hook(
+            model="smart-router",
+            request_kwargs=request_kwargs,
+            messages=[{"role": "user", "content": "Hello!"}],
+        )
+        assert response is not None
+        decision = request_kwargs["metadata"]["routing_decision"]
+        assert decision["router_model_name"] == "smart-router"
+        assert decision["routed_model"] == response.model
+
+    @pytest.mark.asyncio
+    async def test_decision_lands_in_litellm_metadata_and_never_in_caller_metadata(self):
+        """On routes where the caller's `metadata` is a provider body field (e.g.
+        /v1/messages), the proxy bucket is `litellm_metadata`; the decision must land
+        there and must not touch the dict that is forwarded upstream."""
+        router = Router(model_list=self.MODEL_LIST)
+        request_kwargs: Dict = {"litellm_metadata": {}, "metadata": {"user_id": "end-user-1"}}
+        response = await router.async_pre_routing_hook(
+            model="smart-router",
+            request_kwargs=request_kwargs,
+            messages=[{"role": "user", "content": "Hello!"}],
+        )
+        assert response is not None
+        assert "routing_decision" in request_kwargs["litellm_metadata"]
+        assert request_kwargs["metadata"] == {"user_id": "end-user-1"}
+
+    @pytest.mark.asyncio
+    async def test_non_routed_model_writes_no_decision(self):
+        router = Router(model_list=self.MODEL_LIST)
+        request_kwargs: Dict = {}
+        response = await router.async_pre_routing_hook(
+            model="gpt-4o-mini",
+            request_kwargs=request_kwargs,
+            messages=[{"role": "user", "content": "Hello!"}],
+        )
+        assert response is None
+        assert "routing_decision" not in request_kwargs.get("metadata", {})
+
+
+class TestSignalsNeverQuoteTheSystemPrompt:
+    """Signals are persisted to the caller-readable spend log, so they may name a matched
+    term only when the caller supplied it. A term matched solely in the system prompt is
+    reported as a count, which still explains the score without letting a caller recover
+    configured terms from a prompt it cannot see."""
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_only_terms_are_reported_as_a_count(self, complexity_router):
+        response = await complexity_router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={},
+            messages=[
+                {"role": "system", "content": "You operate the kubernetes database api for the deployment pipeline."},
+                {"role": "user", "content": "say hi"},
+            ],
+        )
+        assert response is not None
+        signals = response.routing_decision["signals"]
+        joined = " ".join(signals)
+        # The system prompt drove these matches, so no signal may name them.
+        for term in ("kubernetes", "database", "api", "deployment"):
+            assert term not in joined
+        # The match is still reported, as a count, so the score stays explainable.
+        assert any("matches" in signal for signal in signals)
+
+    @pytest.mark.asyncio
+    async def test_terms_the_caller_supplied_are_still_named(self, complexity_router):
+        response = await complexity_router.async_pre_routing_hook(
+            model="test-complexity-router",
+            request_kwargs={},
+            messages=[
+                {"role": "system", "content": "You operate the kubernetes cluster."},
+                {"role": "user", "content": "help me debug the database api timeout in production"},
+            ],
+        )
+        assert response is not None
+        signals = " ".join(response.routing_decision["signals"])
+        # The caller typed these, so quoting them discloses nothing.
+        assert "database" in signals or "api" in signals
+        # It did not type this one.
+        assert "kubernetes" not in signals
+
+    def test_scoring_still_reads_the_system_prompt(self, complexity_router):
+        """Redaction is a disclosure rule, not a scoring change: the system prompt must
+        still count toward the tier exactly as before."""
+        with_system = complexity_router.classify(
+            "say hi", "You operate the kubernetes database api for the deployment pipeline."
+        )
+        without_system = complexity_router.classify("say hi")
+        assert with_system[1] > without_system[1]

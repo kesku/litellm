@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.types.utils import StandardLoggingRoutingDecision
 
 if TYPE_CHECKING:
     from semantic_router.routers.base import Route
@@ -148,12 +149,26 @@ class AutoRouter(CustomLogger):
         message_content = self._extract_text_from_messages(messages)
         route_choice: Optional[Union[RouteChoice, List[RouteChoice]]] = routelayer(text=message_content)
         verbose_router_logger.debug(f"route_choice: {route_choice}")
+        requested_model = model
+        chosen: RouteChoice | None = None
         if isinstance(route_choice, RouteChoice):
+            chosen = route_choice
             model = route_choice.name or self.default_model
         elif isinstance(route_choice, list):
+            chosen = route_choice[0]
             model = route_choice[0].name or self.default_model
+
+        routing_decision = StandardLoggingRoutingDecision(
+            router_model_name=requested_model,
+            router_type="semantic",
+            routed_model=model,
+            cause="semantic_route" if chosen is not None and chosen.name else "default_fallback",
+        )
+        if chosen is not None and chosen.name and chosen.similarity_score is not None:
+            routing_decision["score"] = chosen.similarity_score
 
         return PreRoutingHookResponse(
             model=model,
             messages=messages,
+            routing_decision=routing_decision,
         )

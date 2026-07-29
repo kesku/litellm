@@ -316,3 +316,76 @@ class TestAutoRouter:
 
         # Assert
         assert result is None
+
+
+class TestAutoRouterRoutingDecision:
+    """The semantic auto-router must report per-request provenance on its hook response,
+    using real RouteChoice instances (a bare MagicMock fails the isinstance gate and
+    silently exercises the no-match path instead)."""
+
+    def _build_router(self, mock_semantic_router_class, mock_router_instance, route_choice) -> AutoRouter:
+        mock_loaded_router = MagicMock()
+        mock_loaded_router.routes = ["route1"]
+        mock_semantic_router_class.from_json.return_value = mock_loaded_router
+        mock_routelayer = MagicMock()
+        mock_routelayer.return_value = route_choice
+        mock_semantic_router_class.return_value = mock_routelayer
+        return AutoRouter(
+            model_name="my-semantic-router",
+            auto_router_config_path="test/path/router.json",
+            default_model="gpt-4o-mini",
+            embedding_model="text-embedding-model",
+            litellm_router_instance=mock_router_instance,
+        )
+
+    @pytest.mark.asyncio
+    @patch("semantic_router.routers.SemanticRouter")
+    @patch("litellm.router_strategy.auto_router.litellm_encoder.LiteLLMRouterEncoder")
+    async def test_semantic_route_decision_carries_similarity_score(
+        self, mock_encoder_class, mock_semantic_router_class
+    ):
+        schema = pytest.importorskip("semantic_router.schema")
+        auto_router = self._build_router(
+            mock_semantic_router_class,
+            MagicMock(),
+            schema.RouteChoice(name="claude-sonnet", similarity_score=0.87),
+        )
+        result = await auto_router.async_pre_routing_hook(
+            model="my-semantic-router",
+            request_kwargs={},
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        assert result is not None
+        assert result.model == "claude-sonnet"
+        decision = result.routing_decision
+        assert decision is not None
+        assert decision["router_model_name"] == "my-semantic-router"
+        assert decision["router_type"] == "semantic"
+        assert decision["cause"] == "semantic_route"
+        assert decision["routed_model"] == "claude-sonnet"
+        assert decision["score"] == 0.87
+
+    @pytest.mark.asyncio
+    @patch("semantic_router.routers.SemanticRouter")
+    @patch("litellm.router_strategy.auto_router.litellm_encoder.LiteLLMRouterEncoder")
+    async def test_no_route_match_decision_is_default_fallback(
+        self, mock_encoder_class, mock_semantic_router_class
+    ):
+        schema = pytest.importorskip("semantic_router.schema")
+        auto_router = self._build_router(
+            mock_semantic_router_class,
+            MagicMock(),
+            schema.RouteChoice(name=None),
+        )
+        result = await auto_router.async_pre_routing_hook(
+            model="my-semantic-router",
+            request_kwargs={},
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        assert result is not None
+        assert result.model == "gpt-4o-mini"
+        decision = result.routing_decision
+        assert decision is not None
+        assert decision["cause"] == "default_fallback"
+        assert decision["routed_model"] == "gpt-4o-mini"
+        assert "score" not in decision
